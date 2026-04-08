@@ -59,7 +59,7 @@ chmod +x scripts/start.sh
 |--------------|----------------------------|-------------------|
 | Jenkins      | http://localhost:8080      | admin / admin123  |
 | Vault UI     | http://localhost:8200      | unseal key + token|
-| Registry     | https://localhost:5000     | reader / writer   |
+| Registry     | https://localhost:5001     | reader / writer   |
 
 ### 5. Запуск pipeline
 В Jenkins UI: открой `build-quarkus-app` → `Build Now`
