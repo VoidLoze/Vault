@@ -28,6 +28,7 @@ services:
     image: hashicorp/vault:1.17
     container_name: vault
     hostname: vault
+    user: "0:0"
     networks:
       - lab5
     ports:
@@ -37,7 +38,7 @@ services:
         {
           "ui": true,
           "listener": [{"tcp": {"address": "0.0.0.0:8200", "tls_disable": "true"}}],
-          "storage": {"file": {"path": "/vault/data"}},
+          "storage": {"file": {"path": "/tmp/vault/data"}},
           "default_lease_ttl": "168h",
           "max_lease_ttl": "720h",
           "disable_mlock": true
@@ -46,7 +47,6 @@ services:
     cap_add:
       - IPC_LOCK
     volumes:
-      - vault-data:/vault/data
       - vault-logs:/vault/logs
     command: server
     healthcheck:

@@ -15,7 +15,11 @@ log() { echo "[vault-init] $*"; }
 wait_vault() {
   log "Ожидание Vault..."
   for i in $(seq 1 30); do
-    vault status -address="$VAULT_ADDR" > /dev/null 2>&1 && return 0
+    # vault status returns non-zero when Vault is sealed, but API is reachable.
+    # Treat any "Initialized/Sealed" response as ready.
+    if vault status -address="$VAULT_ADDR" 2>&1 | grep -qE 'Initialized|Sealed'; then
+      return 0
+    fi
     sleep 2
   done
   echo "Vault не ответил за 60 секунд" && exit 1
@@ -39,13 +43,18 @@ init_vault() {
     INIT_OUTPUT=$(vault operator init \
       -address="$VAULT_ADDR" \
       -key-shares=3 \
-      -key-threshold=2 \
-      -format=json)
+      -key-threshold=2)
 
-    UNSEAL_KEY_1=$(echo "$INIT_OUTPUT" | grep -o '"unseal_keys_b64":\[[^]]*\]' | grep -oP '(?<=")[^"]+(?=")' | sed -n '1p')
-    UNSEAL_KEY_2=$(echo "$INIT_OUTPUT" | grep -o '"unseal_keys_b64":\[[^]]*\]' | grep -oP '(?<=")[^"]+(?=")' | sed -n '2p')
-    UNSEAL_KEY_3=$(echo "$INIT_OUTPUT" | grep -o '"unseal_keys_b64":\[[^]]*\]' | grep -oP '(?<=")[^"]+(?=")' | sed -n '3p')
-    ROOT_TOKEN=$(echo "$INIT_OUTPUT" | grep -o '"root_token":"[^"]*"' | cut -d'"' -f4)
+    # Parse human-readable output (works reliably with BusyBox tools).
+    UNSEAL_KEY_1=$(echo "$INIT_OUTPUT" | awk -F': ' '/Unseal Key 1/{print $2; exit}')
+    UNSEAL_KEY_2=$(echo "$INIT_OUTPUT" | awk -F': ' '/Unseal Key 2/{print $2; exit}')
+    UNSEAL_KEY_3=$(echo "$INIT_OUTPUT" | awk -F': ' '/Unseal Key 3/{print $2; exit}')
+    ROOT_TOKEN=$(echo "$INIT_OUTPUT" | awk -F': ' '/Initial Root Token/{print $2; exit}')
+
+    if [ -z "$UNSEAL_KEY_1" ] || [ -z "$UNSEAL_KEY_2" ] || [ -z "$ROOT_TOKEN" ]; then
+      echo "Не удалось распарсить ключи/токен из vault operator init" >&2
+      exit 1
+    fi
 
     mkdir -p "$CERTS_DIR"
     echo "$UNSEAL_KEY_1" > "$CERTS_DIR/unseal_key_1.txt"
@@ -69,6 +78,10 @@ unseal_vault() {
     log "Vault уже распечатан"
     return 0
   fi
+  if [ -z "$UNSEAL_KEY_1" ] || [ -z "$UNSEAL_KEY_2" ]; then
+    echo "UNSEAL_KEY_1/UNSEAL_KEY_2 пустые. Нужен чистый re-init Vault и пересоздание /certs." >&2
+    exit 1
+  fi
   log "Распечатывание Vault (unseal)..."
   vault operator unseal -address="$VAULT_ADDR" "$UNSEAL_KEY_1"
   vault operator unseal -address="$VAULT_ADDR" "$UNSEAL_KEY_2"
@@ -81,42 +94,54 @@ unseal_vault() {
 setup_pki() {
   export VAULT_TOKEN="$ROOT_TOKEN"
 
-  # Проверяем, настроен ли уже PKI
-  if vault secrets list -address="$VAULT_ADDR" | grep -q "^pki/"; then
-    log "PKI уже настроен, пропускаем"
-    return 0
+  if ! vault secrets list -address="$VAULT_ADDR" | grep -q "^pki/"; then
+    log "Включаем PKI secrets engine..."
+    vault secrets enable -address="$VAULT_ADDR" -path=pki pki
+    vault secrets tune -address="$VAULT_ADDR" -max-lease-ttl=87600h pki
+
+    log "Генерируем корневой CA..."
+    vault write -address="$VAULT_ADDR" -field=certificate pki/root/generate/internal \
+      common_name="Lab5 Root CA" \
+      issuer_name="root-ca" \
+      ttl=87600h > "$CERTS_DIR/ca.crt"
   fi
-
-  log "Включаем PKI secrets engine..."
-  vault secrets enable -address="$VAULT_ADDR" -path=pki pki
-  vault secrets tune -address="$VAULT_ADDR" -max-lease-ttl=87600h pki
-
-  log "Генерируем корневой CA..."
-  vault write -address="$VAULT_ADDR" -field=certificate pki/root/generate/internal \
-    common_name="Lab5 Root CA" \
-    issuer_name="root-ca" \
-    ttl=87600h > "$CERTS_DIR/ca.crt"
 
   vault write -address="$VAULT_ADDR" pki/config/urls \
     issuing_certificates="$VAULT_ADDR/v1/pki/ca" \
     crl_distribution_points="$VAULT_ADDR/v1/pki/crl"
 
   # Промежуточный CA для выдачи сертификатов компонентам
-  vault secrets enable -address="$VAULT_ADDR" -path=pki_int pki
-  vault secrets tune -address="$VAULT_ADDR" -max-lease-ttl=43800h pki_int
+  if ! vault secrets list -address="$VAULT_ADDR" | grep -q "^pki_int/"; then
+    vault secrets enable -address="$VAULT_ADDR" -path=pki_int pki
+    vault secrets tune -address="$VAULT_ADDR" -max-lease-ttl=43800h pki_int
+  fi
 
-  log "Генерируем промежуточный CA..."
-  vault write -address="$VAULT_ADDR" -format=json pki_int/intermediate/generate/internal \
-    common_name="Lab5 Intermediate CA" | \
-    grep -o '"csr":"[^"]*"' | cut -d'"' -f4 | sed 's/\\n/\n/g' > /tmp/pki_int.csr
+  CURRENT_ISSUER_ID=$(
+    vault list -address="$VAULT_ADDR" pki_int/issuers 2>/dev/null | \
+    awk '/^----/{getline; if (NF) {print $1; exit}}'
+  )
 
-  vault write -address="$VAULT_ADDR" -format=json pki/root/sign-intermediate \
-    csr=@/tmp/pki_int.csr \
-    format=pem_bundle \
-    ttl=43800h | \
-    grep -o '"certificate":"[^"]*"' | cut -d'"' -f4 | sed 's/\\n/\n/g' > /tmp/pki_int.crt
+  if [ -z "$CURRENT_ISSUER_ID" ] || [ "$CURRENT_ISSUER_ID" = "default" ]; then
+    log "Генерируем промежуточный CA..."
+    vault write -address="$VAULT_ADDR" -field=csr pki_int/intermediate/generate/internal \
+      common_name="Lab5 Intermediate CA" > /tmp/pki_int.csr
 
-  vault write -address="$VAULT_ADDR" pki_int/intermediate/set-signed certificate=@/tmp/pki_int.crt
+    vault write -address="$VAULT_ADDR" -field=certificate pki/root/sign-intermediate \
+      csr=@/tmp/pki_int.csr \
+      format=pem_bundle \
+      ttl=43800h > /tmp/pki_int.crt
+
+    vault write -address="$VAULT_ADDR" pki_int/intermediate/set-signed certificate=@/tmp/pki_int.crt
+  fi
+
+  # Vault 1.17 requires explicit default issuer for issuing certs.
+  DEFAULT_ISSUER_ID=$(
+    vault list -address="$VAULT_ADDR" pki_int/issuers 2>/dev/null | \
+    awk '/^----/{getline; if (NF) {print $1; exit}}'
+  )
+  if [ -n "$DEFAULT_ISSUER_ID" ] && [ "$DEFAULT_ISSUER_ID" != "default" ]; then
+    vault write -address="$VAULT_ADDR" pki_int/config/issuers default="$DEFAULT_ISSUER_ID" >/dev/null
+  fi
 
   vault write -address="$VAULT_ADDR" pki_int/config/urls \
     issuing_certificates="$VAULT_ADDR/v1/pki_int/ca" \
@@ -179,11 +204,25 @@ issue_certificates() {
 
   mkdir -p "$CERTS_DIR/ca" "$CERTS_DIR/registry" "$CERTS_DIR/docker-daemon"
 
+  # Ensure pki_int has a default issuer even when PKI setup is skipped.
+  DEFAULT_ISSUER_ID=$(
+    vault list -address="$VAULT_ADDR" pki_int/issuers 2>/dev/null | \
+    awk '/^----/{getline; if (NF) {print $1; exit}}'
+  )
+  if [ -n "$DEFAULT_ISSUER_ID" ] && [ "$DEFAULT_ISSUER_ID" != "default" ]; then
+    vault write -address="$VAULT_ADDR" pki_int/config/issuers default="$DEFAULT_ISSUER_ID" >/dev/null
+  fi
+  if [ -z "$DEFAULT_ISSUER_ID" ] || [ "$DEFAULT_ISSUER_ID" = "default" ]; then
+    echo "Не найден валидный issuer в pki_int/issuers" >&2
+    exit 1
+  fi
+
   # Копируем CA cert
   cp "$CERTS_DIR/ca.crt" "$CERTS_DIR/ca/ca.crt"
 
   # Сертификат для Docker daemon
   vault write -address="$VAULT_ADDR" -format=json pki_int/issue/docker-daemon \
+    issuer_ref="$DEFAULT_ISSUER_ID" \
     common_name="docker-daemon" \
     ip_sans="127.0.0.1" \
     ttl="720h" > /tmp/daemon_cert.json
@@ -198,6 +237,7 @@ issue_certificates() {
 
   # Сертификат для Registry
   vault write -address="$VAULT_ADDR" -format=json pki_int/issue/registry \
+    issuer_ref="$DEFAULT_ISSUER_ID" \
     common_name="registry" \
     ip_sans="127.0.0.1" \
     ttl="720h" > /tmp/registry_cert.json
