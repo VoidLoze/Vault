@@ -1,0 +1,91 @@
+pipeline {
+  agent any
+
+  options {
+    timestamps()
+  }
+
+  environment {
+    VAULT_ADDR = 'http://vault:8200'
+    DOCKER_HOST = 'tcp://dockerd:2376'
+    IMAGE_NAME = 'registry:5000/lab5-app'
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('Build and Push') {
+      steps {
+        withVault(
+          configuration: [
+            vaultUrl: "${env.VAULT_ADDR}",
+            vaultCredentialId: 'vault-approle',
+            engineVersion: 2
+          ],
+          vaultSecrets: [
+            [
+              path: 'secret/data/registry/writer',
+              secretValues: [
+                [vaultKey: 'username', envVar: 'REGISTRY_USER'],
+                [vaultKey: 'password', envVar: 'REGISTRY_PASS']
+              ]
+            ],
+            [
+              path: 'pki_int/issue/jenkins-client',
+              secretValues: [
+                [vaultKey: 'certificate', envVar: 'DOCKER_CLIENT_CERT'],
+                [vaultKey: 'private_key', envVar: 'DOCKER_CLIENT_KEY'],
+                [vaultKey: 'issuing_ca', envVar: 'DOCKER_CLIENT_CA']
+              ]
+            ]
+          ]
+        ) {
+          sh '''
+            set +x
+            umask 077
+            mkdir -p "$WORKSPACE/.certs"
+
+            printf "%s\\n" "$DOCKER_CLIENT_CERT" > "$WORKSPACE/.certs/cert.pem"
+            printf "%s\\n" "$DOCKER_CLIENT_KEY" > "$WORKSPACE/.certs/key.pem"
+            printf "%s\\n" "$DOCKER_CLIENT_CA" > "$WORKSPACE/.certs/ca.pem"
+
+            export DOCKER_TLS_VERIFY=1
+            export DOCKER_CERT_PATH="$WORKSPACE/.certs"
+            export DOCKER_BUILDKIT=1
+
+            docker info > /dev/null
+
+            printf "%s" "$REGISTRY_PASS" | docker login registry:5000 --username "$REGISTRY_USER" --password-stdin
+
+            docker pull "$IMAGE_NAME:cache" || true
+
+            docker build \
+              --pull \
+              --cache-from "$IMAGE_NAME:cache" \
+              --build-arg BUILDKIT_INLINE_CACHE=1 \
+              -t "$IMAGE_NAME:${BUILD_NUMBER}" \
+              -t "$IMAGE_NAME:cache" \
+              .
+
+            docker push "$IMAGE_NAME:${BUILD_NUMBER}"
+            docker push "$IMAGE_NAME:cache"
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      sh '''
+        set +e
+        rm -rf "$WORKSPACE/.certs"
+        unset REGISTRY_PASS REGISTRY_USER DOCKER_CLIENT_CERT DOCKER_CLIENT_KEY DOCKER_CLIENT_CA
+      '''
+    }
+  }
+}
