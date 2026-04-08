@@ -1,0 +1,126 @@
+
+networks:
+  lab5:
+    driver: bridge
+
+volumes:
+  vault-data:
+  vault-logs:
+  registry-data:
+  dockerd-data:
+  jenkins-home:
+
+services:
+  nginx:
+    image: nginx:alpine
+    container_name: nginx
+    hostname: nginx
+    networks: [lab5]
+    ports: ["5000:443"]
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/htpasswd:/etc/nginx/htpasswd:ro
+      - ./certs/nginx.crt:/certs/nginx.crt:ro
+      - ./certs/nginx.key:/certs/nginx.key:ro
+    depends_on: [registry]
+
+  vault:
+    image: hashicorp/vault:1.17
+    container_name: vault
+    hostname: vault
+    networks:
+      - lab5
+    ports:
+      - "8200:8200"
+    environment:
+      VAULT_LOCAL_CONFIG: |
+        {
+          "ui": true,
+          "listener": [{"tcp": {"address": "0.0.0.0:8200", "tls_disable": "true"}}],
+          "storage": {"file": {"path": "/vault/data"}},
+          "default_lease_ttl": "168h",
+          "max_lease_ttl": "720h",
+          "disable_mlock": true
+        }
+      VAULT_ADDR: "http://127.0.0.1:8200"
+    cap_add:
+      - IPC_LOCK
+    volumes:
+      - vault-data:/vault/data
+      - vault-logs:/vault/logs
+    command: server
+    healthcheck:
+      test: ["CMD", "sh", "-c", "vault status -address=http://127.0.0.1:8200 2>&1 | grep -qE 'Initialized|Sealed'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  registry:
+    image: registry:2
+    container_name: registry
+    hostname: registry
+    networks:
+      - lab5
+    #ports:
+    #  - "5000:5000"
+    #environment:
+    #  REGISTRY_HTTP_ADDR: "0.0.0.0:5000"
+    #  REGISTRY_HTTP_TLS_CERTIFICATE: /certs/registry.crt
+    #  REGISTRY_HTTP_TLS_KEY: /certs/registry.key
+    #  REGISTRY_AUTH: htpasswd
+    #  REGISTRY_AUTH_HTPASSWD_REALM: "Registry Realm"
+    #  REGISTRY_AUTH_HTPASSWD_PATH: /auth/htpasswd
+    volumes:
+      - ./registry/config.yml:/etc/docker/registry/config.yml:ro
+      - registry-data:/var/lib/registry
+      - ./registry/auth:/auth:ro
+      - ./certs/registry.key:/certs/registry.key:ro
+      - ./certs/registry.crt:/certs/registry.crt:ro
+  
+  dockerd:
+    image: docker:27-dind
+    container_name: dockerd
+    hostname: dockerd
+    privileged: true
+    networks: [lab5]
+    ports: ["2376:2376"]
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+    volumes:
+      - ./certs/ca.crt:/certs/ca.crt:ro
+      - ./certs/dockerd.crt:/certs/server-cert.pem:ro
+      - ./certs/dockerd.key:/certs/server-key.pem:ro
+      - dockerd-data:/var/lib/docker
+    # Bind-mount в .../registry:5000/ ломает парсер volume на Docker Desktop (двоеточие в пути)
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        mkdir -p '/etc/docker/certs.d/registry:5000'
+        && cp /certs/ca.crt '/etc/docker/certs.d/registry:5000/ca.crt'
+        && exec dockerd --host=unix:///var/run/docker.sock --host=tcp://0.0.0.0:2376
+        --tlsverify --tlscacert=/certs/ca.crt --tlscert=/certs/server-cert.pem --tlskey=/certs/server-key.pem
+
+  jenkins:
+    build:
+      context: ./jenkins
+      dockerfile: Dockerfile
+    container_name: jenkins
+    hostname: jenkins
+    networks:
+      - lab5
+    ports:
+      - "8080:8080"
+      - "50000:50000"
+    environment:
+      JAVA_OPTS: "-Djenkins.install.runSetupWizard=false"
+      CASC_JENKINS_CONFIG: /var/jenkins_home/casc.yaml
+      VAULT_ADDR: "http://vault:8200"
+      VAULT_ROLE_ID: "${VAULT_ROLE_ID}"
+      VAULT_SECRET_ID: "${VAULT_SECRET_ID}"
+    volumes:
+      - jenkins-home:/var/jenkins_home
+      - ./jenkins/casc.yaml:/var/jenkins_home/casc.yaml:ro
+      - ./certs:/certs:ro
+
+

@@ -1,0 +1,32 @@
+jenkins:
+  systemMessage: "CI/CD Lab5: Vault + mTLS + Docker Registry"
+  numExecutors: 2
+  scmCheckoutRetryCount: 2
+  mode: NORMAL
+
+  securityRealm:
+    local:
+      allowsSignup: false
+      users:
+        - id: "admin"
+          password: "admin123"
+          properties:
+            - timezone:
+                timeZoneName: "Europe/Riga"
+
+  authorizationStrategy:
+    loggedInUsersCanDoAnything:
+      allowAnonymousRead: false
+
+
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          - vaultAppRoleCredential:
+              id: "vault-approle"
+              description: "Vault AppRole для Jenkins (минимальные права)"
+              roleId: "${VAULT_ROLE_ID}"
+              secretId: "${VAULT_SECRET_ID}"
+              path: "approle"
+

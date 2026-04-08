@@ -1,0 +1,17 @@
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          - string:
+              scope: GLOBAL
+              id: "vault-role-id"
+              description: "Vault AppRole RoleID"
+              secret: "${VAULT_ROLE_ID}"
+          - string:
+              scope: GLOBAL
+              id: "vault-secret-id"
+              description: "Vault AppRole SecretID"
+              secret: "${VAULT_SECRET_ID}"
+
+jenkins:
+  systemMessage: "Lab5 Jenkins — CI/CD с Vault + mTLS"

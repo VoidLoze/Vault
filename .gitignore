@@ -1,0 +1,9 @@
+# Секреты — НИКОГДА не коммитить
+.env
+certs/
+registry/auth/htpasswd
+
+# Артефакты сборки
+*.class
+*.jar
+build/
