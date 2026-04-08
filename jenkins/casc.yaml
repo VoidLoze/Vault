@@ -3,23 +3,6 @@ jenkins:
   numExecutors: 2
   scmCheckoutRetryCount: 2
   mode: NORMAL
-  jobs:
-    - script: >
-        pipelineJob('build-quarkus-app') {
-          definition {
-            cpsScm {
-              scm {
-                git {
-                  remote {
-                    url('https://github.com/VoidLoze/Vault.git')
-                  }
-                  branch('*/main')
-                }
-              }
-              scriptPath('Jenkinsfile')
-            }
-          }
-        }
 
   securityRealm:
     local:
@@ -34,7 +17,6 @@ jenkins:
   authorizationStrategy:
     loggedInUsersCanDoAnything:
       allowAnonymousRead: false
-
 
 credentials:
   system:
